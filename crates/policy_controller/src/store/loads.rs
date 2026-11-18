@@ -113,7 +113,9 @@ pub trait LoadSink: Send + Sync {
     /// answer names that rank or not. Whether a stream still serves a
     /// rank the poll was not for is the caller's to know, by the
     /// freshness it chose the poll's ranks with: it says the word only
-    /// for a poll that left out no such rank.
+    /// for a poll that left out no such rank. A row the answer brings for
+    /// a rank that pushed since the poll began is passed over, and names
+    /// its engine all the same: a rank left out beside it is avoided.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
