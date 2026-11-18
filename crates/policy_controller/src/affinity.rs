@@ -1094,7 +1094,7 @@ impl Lifecycle for WarmupSlice {
                     .lock()
                     .retain(|worker, _| ids.contains(worker));
             }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }

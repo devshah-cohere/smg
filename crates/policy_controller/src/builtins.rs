@@ -753,7 +753,7 @@ impl Credits {
                 sorted.sort_unstable();
                 self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
             }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }
