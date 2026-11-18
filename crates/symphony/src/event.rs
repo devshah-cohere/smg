@@ -610,6 +610,8 @@ pub fn first_call_only(events: &mut [Event]) {
 /// call become its dropped text, as [`first_call_only`] drops the later calls, so a call the
 /// model writes anyway is neither a call nor content, as the engine's own server reads and
 /// withholds it; the finish counts none, and a `tool_calls` finish is the engine's `stop` again.
+/// A caller may pass one call's events alone: under a choice that narrows the tools, the call to
+/// a function the choice leaves out, and the finish once no call is kept.
 pub fn forbidden_calls(events: &mut [Event]) {
     drop_calls_from(events, 0, DropReason::ForbiddenCall);
 }

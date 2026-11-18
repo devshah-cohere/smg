@@ -140,7 +140,8 @@ pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
 /// Calls the request's `tool_choice` forbade that the model wrote anyway, read whole and dropped,
 /// by `table`: every call under `none`, as the engine's own server reads and withholds such a
 /// call, and a call outside the callable tools under a named function, an allowed list or
-/// `required`.
+/// `required`. The list may be the gateway's own: the final turn of a Responses tool loop allows
+/// the request's own tools alone, so a server tool's call written on it counts here too.
 pub(crate) const CALLS_FORBIDDEN: &str = "smg_symphony_calls_forbidden_total";
 /// Requests Symphony was configured for that the legacy parsers read, by `reason`, under the
 /// table `none` ([`record_fallback`]).
