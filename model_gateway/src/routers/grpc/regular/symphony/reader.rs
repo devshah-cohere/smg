@@ -943,12 +943,12 @@ impl Reader {
         }
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
-        for event in fresh.iter() {
-            if self.forbidden.any {
-                // Tallied at the step's end, where the calls the choice forbids are dropped.
-                break;
+        // Under a choice that forbids calls the step is tallied where they are dropped
+        // ([`ForbiddenCalls::drop_from`]).
+        if !self.forbidden.any {
+            for event in fresh.iter() {
+                self.tally.see(event, self.first_call_only);
             }
-            self.tally.see(event, self.first_call_only);
         }
         // While the output makes no call, the bytes of the call blocks the table refuses are
         // kept for the end ([`Self::end`]), with the marker that led into the first and what the
