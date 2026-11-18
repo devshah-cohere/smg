@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
-    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    Ask, BatchFacts, BatchOutcome, ContentHash, DecodeSide, Dispatch, GatewayId, HealthSink,
+    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
     ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
     SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
@@ -16,7 +16,7 @@ use super::{
 use crate::{
     decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
+    view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -1412,7 +1412,7 @@ fn a_pairs_record_stands_until_its_decode_side_completes() {
     let now = Instant::now();
     let gateway = GatewayId(1);
     let mut pair = lease(gateway, 5, 0, now);
-    pair.decode = Some(WorkerId(8));
+    pair.decode = Some(decode_side(WorkerId(8)));
     assert_eq!(leases.issue(pair), Ok(()));
     let mut outcome = Outcome {
         side: Side::Prefill,
@@ -1432,6 +1432,250 @@ fn a_pairs_record_stands_until_its_decode_side_completes() {
     outcome.side = Side::Decode;
     assert!(leases.completed(gateway, LeaseId(5), &outcome));
     assert!(leases.get(gateway, LeaseId(5)).is_none());
+}
+
+/// What the leases on file book on each of `workers`, in their order.
+fn booked(store: &MemoryStore, workers: &[WorkerId]) -> Vec<u32> {
+    let rows = in_flight(store);
+    let count = |id: &WorkerId| {
+        rows.iter()
+            .find(|(row, _)| row == id)
+            .map(|(_, count)| *count)
+    };
+    workers.iter().map(|id| count(id).unwrap_or(0)).collect()
+}
+
+/// A pair's record under `id`: the prefill side on `prefill`, the decode
+/// side on the first of `decodes`, the rest the pick's alternates.
+fn pair(id: u64, prefill: WorkerId, decodes: &[WorkerId], now: Instant) -> LeaseRecord {
+    let mut targets = Targets::new();
+    for &decode_id in decodes {
+        let pair = crate::decision::Pair {
+            decode_id,
+            ..Default::default()
+        };
+        targets.push(Target {
+            id: prefill,
+            pair: Some(pair),
+            ..Target::default()
+        });
+    }
+    let mut record = booking(GatewayId(1), id, prefill, now);
+    record.lease.side = Side::Prefill;
+    record.picked = Picked::of(&targets);
+    record.decode = Some(DecodeSide {
+        picked: Picked::of_decodes(&targets),
+        ..decode_side(decodes[0])
+    });
+    record
+}
+
+/// A dispatch of `side` on the pick's target at `index`.
+fn on(side: Side, index: u8) -> Dispatch {
+    Dispatch {
+        target_index: index,
+        side,
+        ..Dispatch::default()
+    }
+}
+
+/// A completion of `side`.
+fn done(side: Side) -> Outcome {
+    Outcome {
+        side,
+        served: WorkerId(0),
+        status: 200,
+        class: TransportClass::Ok,
+        ttft_micros: 0,
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_micros: 0,
+    }
+}
+
+/// Where each side of the pair's lease under `id` stands.
+fn sides(store: &MemoryStore, id: u64) -> Option<(LeaseState, LeaseState)> {
+    let record = LeasesStore::get(store, GatewayId(1), LeaseId(id))?;
+    Some((record.state, record.decode?.state))
+}
+
+/// A pair filed with a side that ended books the side that lives, and
+/// no count for the one that ended.
+#[test]
+fn a_pair_filed_with_an_ended_side_books_the_side_that_lives() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let ended = LeaseState::Completed;
+    let mut half = pair(1, p, &[d], now);
+    half.decode = half.decode.map(|side| DecodeSide {
+        state: ended,
+        ..side
+    });
+    leases.issue(half).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    let mut half = pair(2, p, &[d], now);
+    half.state = ended;
+    leases.issue(half).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert_eq!(leases.live(gateway), 2);
+}
+
+#[test]
+fn a_pairs_sides_are_dispatched_and_ended_each_by_its_own_frame() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    leases
+        .issue(pair(1, p, &[d], now))
+        .expect("the key is free");
+    // One record, and each side books its own worker.
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert_eq!(leases.live(gateway), 1);
+    // A side is dispatched by the frame that names it, and no other is.
+    let at = now + Duration::from_millis(3);
+    let dispatched = LeaseState::Dispatched { at };
+    assert!(leases.dispatched(gateway, key, on(Side::Decode, 0), at));
+    assert_eq!(sides(&store, 1), Some((LeaseState::Issued, dispatched)));
+    assert!(leases.dispatched(gateway, key, on(Side::Prefill, 0), at));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    // A frame on a side the pair does not hold changes nothing.
+    assert!(leases.dispatched(gateway, key, on(Side::Single, 0), now));
+    assert!(leases.completed(gateway, key, &done(Side::Encode)));
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, key, Some(Side::Single), gone));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    // The prefill's completion frees its worker's count, and the decode's
+    // stands; a second completion of that side changes nothing.
+    for _ in 0..2 {
+        assert!(leases.completed(gateway, key, &done(Side::Prefill)));
+        assert_eq!(booked(&store, &[p, d]), [0, 1]);
+        assert_eq!(sides(&store, 1), Some((LeaseState::Completed, dispatched)));
+        assert_eq!(leases.live(gateway), 1);
+    }
+    // The record leaves the file at its last side's end.
+    assert!(leases.completed(gateway, key, &done(Side::Decode)));
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    assert_eq!(leases.get(gateway, key), None);
+    assert!(!leases.completed(gateway, key, &done(Side::Decode)));
+}
+
+#[test]
+fn a_decodes_dispatch_on_an_alternate_moves_the_decodes_booking_alone() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    leases
+        .issue(pair(1, p, &[d0, d1], now))
+        .expect("the key is free");
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
+    // Every target of a pair's pick names the one prefill: its dispatch on
+    // the alternate's index moves no booking.
+    assert!(leases.dispatched(gateway, key, on(Side::Prefill, 1), now));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
+    assert!(leases.dispatched(gateway, key, on(Side::Decode, 1), now));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
+    let filed = leases.get(gateway, key).expect("on file");
+    assert_eq!((filed.target, filed.lease.target_index), (p, 0));
+    let decode = filed.decode.expect("a pair's record");
+    assert_eq!((decode.target, decode.target_index), (d1, 1));
+    assert_eq!(filed.target_of(Side::Decode, 1), Some((d1, 0)));
+    // The decode's end frees the count of the worker it moved to.
+    assert!(leases.completed(gateway, key, &done(Side::Decode)));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 0]);
+}
+
+#[test]
+fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now, gone) = (GatewayId(1), Instant::now(), ReleaseReason::ClientGone);
+    leases.set_term(1);
+    leases
+        .issue(pair(1, p, &[d], now))
+        .expect("the key is free");
+    // One side given up: its count is free and the other side stands.
+    assert!(leases.released(gateway, LeaseId(1), Some(Side::Decode), gone));
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    let released = LeaseState::Released(gone);
+    assert_eq!(sides(&store, 1), Some((LeaseState::Issued, released)));
+    // The last side's release takes the record off the file.
+    assert!(leases.released(gateway, LeaseId(1), Some(Side::Prefill), gone));
+    assert_eq!(leases.get(gateway, LeaseId(1)), None);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    // A release that names no side ends every side at once.
+    leases
+        .issue(pair(2, p, &[d], now))
+        .expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert!(leases.released(gateway, LeaseId(2), None, gone));
+    assert_eq!(leases.get(gateway, LeaseId(2)), None);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    assert_eq!(leases.live(gateway), 0);
+}
+
+#[test]
+fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    // Two pairs: the first's prefill is dispatched, the second waits whole.
+    for id in [1, 2] {
+        leases
+            .issue(pair(id, p, &[d], now))
+            .expect("the key is free");
+    }
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert_eq!(booked(&store, &[p, d]), [2, 2]);
+    // An issue past the deadline ends what waits and hands back the lease
+    // of each side it ended, the prefill's first.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    let (_, ended) = store
+        .issue_decided(booking(gateway, 0, p, later), [world.booked_of(p), None])
+        .expect("minted under the store's term");
+    let told = ended.map(|sides| sides.map(|sides| sides.map(|side| side.map(|lease| lease.side))));
+    assert_eq!(
+        told,
+        [
+            Some([None, Some(Side::Decode)]),
+            Some([Some(Side::Prefill), Some(Side::Decode)]),
+        ]
+    );
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    let dispatched = LeaseState::Dispatched { at: now };
+    // The dispatched side stands with its count; the pair that waited
+    // whole left the file.
+    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
+    assert_eq!(leases.get(gateway, LeaseId(2)), None);
+    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+    // The side that stands ends by its own frame.
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
+    assert_eq!(leases.get(gateway, LeaseId(1)), None);
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    // The store's own sweep hands a pair's record back as it left it.
+    leases
+        .issue(pair(3, p, &[d], later))
+        .expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 0), later));
+    let swept = leases.expire(later + Duration::from_secs(9));
+    let states = |record: &LeaseRecord| (record.state, record.decode.map(|side| side.state));
+    let at = LeaseState::Dispatched { at: later };
+    assert!(swept
+        .iter()
+        .map(states)
+        .any(|sides| sides == (abandoned, Some(at))));
+    assert_eq!(sides(&store, 3), Some((abandoned, at)));
 }
 
 #[test]
@@ -1648,6 +1892,18 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
 /// [`in_flight_for`] the gateway the cases issue their leases to.
 fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
     in_flight_for(store, GatewayId(1))
+}
+
+/// A pair's decode side on `target`: issued, with no alternate behind it.
+fn decode_side(target: WorkerId) -> DecodeSide {
+    DecodeSide {
+        target,
+        picked: Picked::default(),
+        session: Session::NONE,
+        state: LeaseState::Issued,
+        tokens: 0,
+        target_index: 0,
+    }
 }
 
 /// A lease of `gateway` on `target`, issued at `now` under term 1.
@@ -2074,7 +2330,7 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
             term,
             ..booking(gateway, 0, a, now)
         };
-        let issued = store.issue_decided(record, world.booked_of(a));
+        let issued = store.issue_decided(record, [world.booked_of(a), None]);
         issued.map(|(lease, _)| lease.id.0)
     };
     leases.set_term(3);
@@ -2125,12 +2381,12 @@ fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u6
     };
     let world = store.world();
     let (lease, ended) = store
-        .issue_decided(record, world.booked_of(target))
+        .issue_decided(record, [world.booked_of(target), None])
         .expect("minted under the store's term");
-    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-    let ended = ended.iter().flatten().map(|record| {
-        assert_eq!(record.state, abandoned);
-        counter(record.lease.id)
+    // A single's lease ends whole: one side an ended lease.
+    let ended = ended.iter().flatten().map(|sides| {
+        assert!(sides[1].is_none());
+        counter(sides[0].expect("the lease that ended").id)
     });
     (counter(lease.id), ended.collect())
 }

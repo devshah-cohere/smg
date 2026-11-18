@@ -32,9 +32,12 @@
 //!   view as the row's decider reads it and the engine's decide on this
 //!   thread), `commit` (the same with the pick's lease issued at the
 //!   store's leases door and ended there, as a host that embeds the engine
-//!   commits a decision) or `stream` (the decision asked over one stream,
+//!   commits a decision), `stream` (the decision asked over one stream,
 //!   one at a time so every decision wakes the same threads whatever its
-//!   fleet, the client's own calls included). A run's instructions are read
+//!   fleet, the client's own calls included) or `pair` (the `stream` cell
+//!   under a pair plan, over that many prefills and as many decodes: each
+//!   request enters at the pair's prefill, and its one answer names both
+//!   workers under two leases of one id). A run's instructions are read
 //!   from outside it (`perf stat -e instructions:u`): two runs of different
 //!   length give a
 //!   decision's by their difference. A counted run's window holds whole
@@ -125,7 +128,7 @@ use smg_policy_controller::{
     proto::{
         controller_frame, decide_answer::Answer, decision::Outcome, gateway_frame::Frame,
         policy_controller_client::PolicyControllerClient, ControllerFrame, DecideRequest, Decision,
-        GatewayFrame, Hello, RequestFacts as WireFacts,
+        GatewayFrame, Hello, Phase as WirePhase, RequestFacts as WireFacts,
     },
     store::{
         Ask, GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
@@ -329,6 +332,17 @@ static GLOBAL: Counted = Counted;
 
 const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
+/// The pair plan of the pair count cell: the plan of the engine's own
+/// pair cells (`pair_classes`), least load on each side.
+const PAIR_PLAN: &str = r#"{
+  "apiVersion": "smg.policy/v1",
+  "profiles": {
+    "side": { "filter": ["healthy", "not-overloaded", "not-tried"], "score": ["least-load"], "pick": "best" }
+  },
+  "bindings": [
+    { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "side", "decode": "side" } }
+  ]
+}"#;
 /// The controller's runtime threads.
 const SERVER_THREADS: usize = 2;
 /// The slots a stream keeps its requests' send instants in, each beside
@@ -367,6 +381,9 @@ struct Shape {
     measured: u64,
     /// The allocator counts over the measured decisions.
     counted: bool,
+    /// A pair plan's row: `members` prefills and as many decodes, each
+    /// request asked at the pair's prefill and answered for both sides.
+    pair: bool,
 }
 
 /// A controller served on its own thread and runtime.
@@ -459,18 +476,29 @@ fn bands(members: u32) -> Vec<u32> {
 
 /// `members` ready members that serve every one of `models` models, each
 /// with a load report in its band ([`bands`]), under the row's preset as
-/// generation 1.
-fn fill(store: &MemoryStore, members: u32, models: u32) {
+/// generation 1. A pair plan's row holds that many members a side, under
+/// the pair cell's plan.
+fn fill(store: &MemoryStore, members: u32, models: u32, pair: bool) {
     let models: Vec<String> = (0..models).map(model).collect();
     let now = Instant::now();
-    for (index, band) in (0..members).zip(bands(members)) {
-        let key = format!("http://worker-{index}.fleet:8000");
+    let sides: &[(Role, &str)] = if pair {
+        &[(Role::Prefill, "prefill"), (Role::Decode, "decode")]
+    } else {
+        &[(Role::Single, "worker")]
+    };
+    let band_of = bands(members);
+    let rows = sides.iter().flat_map(|&(role, name)| {
+        let banded = (0..members).zip(band_of.iter().copied());
+        banded.map(move |(index, band)| (role, name, index, band))
+    });
+    for (role, name, index, band) in rows {
+        let key = format!("http://{name}-{index}.fleet:8000");
         let id = store
             .upsert(WorkerFacts {
                 key: key.clone(),
                 engine: key,
                 incarnation: 1,
-                role: Role::Single,
+                role,
                 models: models.clone(),
                 dp_size: 1,
                 max_running: Some(2 * HELD),
@@ -491,9 +519,13 @@ fn fill(store: &MemoryStore, members: u32, models: u32) {
             LoadSource::Stream,
         );
     }
-    let mut document = PolicySpec::preset(PRESET).expect("a preset of this build");
+    let mut document = if pair {
+        serde_json::from_str::<PolicySpec>(PAIR_PLAN).expect("a well-formed document")
+    } else {
+        PolicySpec::preset(PRESET).expect("a preset of this build")
+    };
     document.generation = 1;
-    let spec = AppliedSpec::validate(&document).expect("the preset validates");
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");
 }
 
@@ -516,7 +548,7 @@ fn serve(shape: Shape) -> Served {
                     .identity_as_told("gateway")
                     .expect("a listener of the configuration");
                 let store = controller.store();
-                fill(&store, shape.members, shape.models);
+                fill(&store, shape.members, shape.models, shape.pair);
                 let addr = controller
                     .addresses()
                     .of(Scope::Gateway)
@@ -695,16 +727,22 @@ fn slot(id: u64) -> usize {
 }
 
 /// Request `id` of a row, for one of its models.
-fn request(id: u64, models: &[String]) -> DecideRequest {
+fn request(id: u64, models: &[String], pair: bool) -> DecideRequest {
     let name = models
         .get(slot(id) % models.len().max(1))
         .expect("a model of the row");
+    let phase = if pair {
+        WirePhase::Prefill
+    } else {
+        WirePhase::default()
+    };
     DecideRequest {
         request_id: id.to_be_bytes().to_vec(),
         facts: Some(WireFacts {
             model: name.clone(),
             seed: id,
             budget_micros: BUDGET_MICROS,
+            phase: phase.into(),
             ..WireFacts::default()
         }),
         constraints: None,
@@ -717,10 +755,11 @@ async fn hand(
     sent_at: &mut [(u64, Instant)],
     next: &mut u64,
     models: &[String],
+    pair: bool,
 ) {
     let id = *next;
     *next += 1;
-    let frame = request(id, models);
+    let frame = request(id, models, pair);
     if let Some(at) = sent_at.get_mut(slot(id)) {
         *at = (id, Instant::now());
     }
@@ -761,7 +800,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         counting();
     }
     for _ in 0..shape.in_flight {
-        hand(&requests, &mut sent_at, &mut next, &models).await;
+        hand(&requests, &mut sent_at, &mut next, &models, shape.pair).await;
     }
     let mut done = 0;
     loop {
@@ -817,7 +856,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         if shape.counted && done == shape.warm {
             counting();
         }
-        hand(&requests, &mut sent_at, &mut next, &models).await;
+        hand(&requests, &mut sent_at, &mut next, &models, shape.pair).await;
     }
     if shape.counted {
         COUNTING.store(false, Ordering::Relaxed);
@@ -876,7 +915,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
                     tally.late += 1;
                 }
                 requests
-                    .try_send(request(next, &models))
+                    .try_send(request(next, &models, shape.pair))
                     .expect("a window of requests fits the stream's channel");
                 credit -= 1;
             }
@@ -1210,6 +1249,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         warm: 2_000,
         measured: decisions,
         counted: true,
+        pair: mode == "pair",
     };
     let (calls, busy) = match mode {
         "in_process" | "commit" => {
@@ -1218,11 +1258,16 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             served.stop();
             (calls, 0)
         }
-        "stream" => {
+        "stream" | "pair" => {
             let row = wire(shape);
             (row.calls, row.busy)
         }
-        _ => return writeln!(out, "a count row's mode is in_process, commit or stream"),
+        _ => {
+            return writeln!(
+                out,
+                "a count row's mode is in_process, commit, stream or pair"
+            )
+        }
     };
     writeln!(
         out,
@@ -1271,6 +1316,7 @@ fn main() -> io::Result<()> {
                 warm,
                 measured,
                 counted: false,
+                pair: false,
             });
             writeln!(
                 out,
@@ -1306,6 +1352,7 @@ fn main() -> io::Result<()> {
                 warm: warm / u64::from(streams),
                 measured: measured / u64::from(streams),
                 counted: false,
+                pair: false,
             });
             writeln!(
                 out,
@@ -1339,6 +1386,7 @@ fn main() -> io::Result<()> {
                     warm,
                     measured,
                     counted: false,
+                    pair: false,
                 });
                 writeln!(
                     out,

@@ -17,7 +17,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    lease::{Lease, LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
         health::{HealthSink, VetoWrite},
@@ -2055,6 +2055,11 @@ struct Leases {
 /// A lease's key on file: its gateway and its id.
 type Key = (GatewayId, LeaseId);
 
+/// The lease of each side of one record that its dispatch deadline ended:
+/// a single's one lease, or a pair's prefill side and then its decode
+/// side.
+type Ended = [Option<Lease>; 2];
+
 /// The leases past their dispatch deadline that one issue ends at most.
 #[cfg(any(test, feature = "controller"))]
 pub(crate) const ABANDONED: usize = 2;
@@ -2071,6 +2076,43 @@ struct Held {
     /// `None` for a lease whose worker stood in no pool when it was
     /// written: it books no row a decision reads.
     booked: Option<Slot>,
+    /// The slot of the count a pair's decode side books, until that side
+    /// ends; `None` for a single's lease.
+    decode: Option<Slot>,
+}
+
+impl Held {
+    /// `record` with `booked`, the slots of its target's count and of its
+    /// decode's: a pair's side that ended books none.
+    fn of(record: LeaseRecord, [booked, decode]: [Option<Slot>; 2]) -> Self {
+        let pair = record.decode;
+        Self {
+            record,
+            booked: booked.filter(|_| pair.is_none() || record.state.is_live()),
+            decode: decode.filter(|_| pair.is_some_and(|side| side.state.is_live())),
+        }
+    }
+}
+
+/// The slots of the counts `record`'s sides book wherever `world` lists
+/// their workers: its target's and, for a pair, its decode's.
+fn slots(world: &World, record: &LeaseRecord) -> [Option<Slot>; 2] {
+    [
+        world.booked_of(record.target),
+        record.decode.and_then(|side| world.booked_of(side.target)),
+    ]
+}
+
+/// Moves a side's booking to the slot `to`: the count it booked is free
+/// and `to`'s is booked.
+fn rebook(counts: &Counts, booked: &mut Option<Slot>, to: Option<Slot>) {
+    if let Some(booked) = *booked {
+        counts.free(booked);
+    }
+    *booked = to;
+    if let Some(booked) = to {
+        counts.book(booked);
+    }
 }
 
 impl Leases {
@@ -2094,22 +2136,25 @@ impl Leases {
         Some(LeaseId(term << 32 | u64::from(next)))
     }
 
-    /// Files `record` under `key`: a record on file under that key gives
-    /// its counts back first.
-    fn file(&mut self, key: Key, record: LeaseRecord, booked: Option<Slot>) {
+    /// Files `record` under `key` with `booked`, the slots of the counts
+    /// its sides book: a record on file under that key gives its counts
+    /// back first.
+    fn file(&mut self, key: Key, record: LeaseRecord, booked: [Option<Slot>; 2]) {
         self.end(&key);
-        self.records.insert(key, Held { record, booked });
+        let held = Held::of(record, booked);
+        let booked = [held.booked, held.decode];
+        self.records.insert(key, held);
         self.laid(key, &record, booked);
     }
 
-    /// What a record just laid on file takes: it books `booked`, its
-    /// worker's count, and its dispatch deadline is queued where it is
-    /// filed as issued.
-    fn laid(&mut self, key: Key, record: &LeaseRecord, booked: Option<Slot>) {
-        if let Some(booked) = booked {
+    /// What a record just laid on file takes: each side books its worker's
+    /// count, and the dispatch deadline is queued where a side is filed as
+    /// issued.
+    fn laid(&mut self, key: Key, record: &LeaseRecord, booked: [Option<Slot>; 2]) {
+        for booked in booked.into_iter().flatten() {
             self.counts.book(booked);
         }
-        if record.state == LeaseState::Issued {
+        if record.waits() {
             self.queue(record.dispatch_deadline, key);
         }
     }
@@ -2126,10 +2171,35 @@ impl Leases {
     /// the one way a record leaves the file, whichever door ends it.
     fn end(&mut self, key: &Key) -> Option<LeaseRecord> {
         let held = self.records.remove(key)?;
-        if let Some(booked) = held.booked {
+        for booked in [held.booked, held.decode].into_iter().flatten() {
             self.counts.free(booked);
         }
         Some(held.record)
+    }
+
+    /// Ends `side` of the pair's lease under `key` as `ended` and gives
+    /// that side's count back; the record leaves the file with its last
+    /// side. A side the record does not hold, or one that ended, changes
+    /// nothing.
+    fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) {
+        let Some(held) = self.records.get_mut(key) else {
+            return;
+        };
+        let (state, booked) = match (side, held.record.decode.as_mut()) {
+            (Side::Prefill, Some(_)) => (&mut held.record.state, &mut held.booked),
+            (Side::Decode, Some(decode)) => (&mut decode.state, &mut held.decode),
+            _ => return,
+        };
+        if !state.is_live() {
+            return;
+        }
+        *state = ended;
+        if let Some(booked) = booked.take() {
+            self.counts.free(booked);
+        }
+        if !held.record.is_live() {
+            self.end(key);
+        }
     }
 
     /// Queues `deadline` in its order. The deadlines come in rising order
@@ -2155,25 +2225,51 @@ impl Leases {
     /// lease that waits out its deadline it keeps a place for every issue
     /// since, the deadline's span of them at most. `None` at a first place
     /// whose lease waits inside its deadline, at an empty queue and once
-    /// the steps are spent.
-    fn end_due(&mut self, now: Instant, steps: &mut usize) -> Option<LeaseRecord> {
+    /// the steps are spent. A lease waits while a side of it does
+    /// ([`Leases::abandon`]).
+    fn end_due(&mut self, now: Instant, steps: &mut usize) -> Option<(LeaseRecord, Ended)> {
         while *steps > 0 {
             let &(due, key) = self.due.front()?;
-            let waits = self.records.get(&key).is_some_and(|held| {
-                held.record.state == LeaseState::Issued && held.record.dispatch_deadline == due
-            });
+            let waits = self
+                .records
+                .get(&key)
+                .is_some_and(|held| held.record.waits() && held.record.dispatch_deadline == due);
             if waits && due > now {
                 return None;
             }
             self.due.pop_front();
             *steps -= 1;
             if waits {
-                let mut record = self.end(&key)?;
-                record.state = LeaseState::Released(ReleaseReason::Abandoned);
-                return Some(record);
+                return self.abandon(&key);
             }
         }
         None
+    }
+
+    /// Ends what waits of the lease under `key` as abandoned: a single's
+    /// lease whole, and of a pair's each side no dispatch named, while a
+    /// side that was dispatched stands. The record comes back as the call
+    /// left it, with the lease of each side it ended, the prefill's first.
+    fn abandon(&mut self, key: &Key) -> Option<(LeaseRecord, Ended)> {
+        let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+        let mut record = self.records.get(key)?.record;
+        let Some(decode) = record.decode.as_mut() else {
+            self.end(key);
+            record.state = abandoned;
+            return Some((record, [Some(record.lease), None]));
+        };
+        let mut ended = [None, None];
+        if decode.state == LeaseState::Issued {
+            ended[1] = Some(decode.lease(&record.lease));
+            decode.state = abandoned;
+            self.end_side(key, Side::Decode, abandoned);
+        }
+        if record.state == LeaseState::Issued {
+            ended[0] = Some(record.lease);
+            record.state = abandoned;
+            self.end_side(key, Side::Prefill, abandoned);
+        }
+        Some((record, ended))
     }
 }
 
@@ -2195,9 +2291,11 @@ impl MemoryStore {
 
     /// Issues the lease of one decision made under `record.term`, the
     /// store's own term: the store mints its id ([`Leases::mint`]), files
-    /// the record under it and books `booked`, the slot of the record's
-    /// target's count as the decision's own world names it
-    /// ([`World::booked`]). `Ok` is the lease as filed, with its id.
+    /// the record under it and books `booked`, the slots of the counts its
+    /// sides book as the decision's own world names them
+    /// ([`World::booked`]): the record's target's and, for a pair, its
+    /// decode's. `Ok` is the lease as filed, with its id, which a pair's
+    /// two sides share.
     ///
     /// # Errors
     ///
@@ -2207,8 +2305,8 @@ impl MemoryStore {
     ///
     /// The same call ends the leases at the head of the deadline queue
     /// that no gateway named a dispatch for by `record.issued_at`,
-    /// [`ABANDONED`] of them at most, and hands them back released as
-    /// abandoned, for their engine to be told outside the lock. So a lease
+    /// [`ABANDONED`] of them at most, and hands back the lease of each
+    /// side it ended, for their engine to be told outside the lock. So a lease
     /// past its deadline stands no longer than the next issues take, and no
     /// call passes over the file: an issue adds one place to the queue and
     /// steps over [`DUE_STEPS`] at most.
@@ -2216,8 +2314,8 @@ impl MemoryStore {
     pub(crate) fn issue_decided(
         &self,
         mut record: LeaseRecord,
-        booked: Option<Slot>,
-    ) -> Result<(crate::Lease, [Option<LeaseRecord>; ABANDONED]), LeaseRefused> {
+        booked: [Option<Slot>; 2],
+    ) -> Result<(Lease, [Option<Ended>; ABANDONED]), LeaseRefused> {
         use std::collections::hash_map::Entry;
 
         let mut leases = self.leases.lock();
@@ -2229,13 +2327,17 @@ impl MemoryStore {
         if lease < store {
             return Err(unminted);
         }
-        let key = loop {
+        let (key, booked) = loop {
             record.lease.id = leases.mint().ok_or(unminted)?;
             let key = (record.gateway, record.lease.id);
             // An id on file already is a restored lease's: the next one.
             if let Entry::Vacant(place) = leases.records.entry(key) {
-                place.insert(Held { record, booked });
-                break key;
+                // The slots are laid as held, as the file's own filing
+                // lays them.
+                let held = Held::of(record, booked);
+                let booked = [held.booked, held.decode];
+                place.insert(held);
+                break (key, booked);
             }
         };
         leases.laid(key, &record, booked);
@@ -2243,8 +2345,10 @@ impl MemoryStore {
         // call that ends none stopped at a lease that waits, at an empty
         // queue or at its last step, and so would the next.
         let (now, mut steps) = (record.issued_at, DUE_STEPS);
-        let first = leases.end_due(now, &mut steps);
-        let second = first.and_then(|_| leases.end_due(now, &mut steps));
+        let first = leases.end_due(now, &mut steps).map(|(_, ended)| ended);
+        let second = first
+            .and_then(|_| leases.end_due(now, &mut steps))
+            .map(|(_, ended)| ended);
         Ok((record.lease, [first, second]))
     }
 }
@@ -2271,7 +2375,7 @@ impl LeasesStore for MemoryStore {
         // The slot of the record's target's count, where the standing world
         // lists it: read before the leases' lock, which nests with no other.
         let world = self.world.load();
-        let booked = world.booked_of(record.target);
+        let booked = slots(&world, &record);
         let mut leases = self.leases.lock();
         if record.term > leases.term {
             return Err(LeaseRefused::TermAhead {
@@ -2304,6 +2408,30 @@ impl LeasesStore for MemoryStore {
         let Some(held) = leases.records.get_mut(&(gateway, lease)) else {
             return false;
         };
+        // A pair's lease moves by the side its frame names. Every target
+        // of a pair's pick names the one prefill, so that side's dispatch
+        // moves no booking; the decode's on another target of the pick
+        // moves the decode's booking alone.
+        if held.record.decode.is_some() {
+            let named = held.record.target_of(Side::Decode, dispatch.target_index);
+            match (dispatch.side, held.record.decode.as_mut()) {
+                (Side::Prefill, _) if held.record.state == LeaseState::Issued => {
+                    held.record.state = LeaseState::Dispatched { at };
+                }
+                (Side::Decode, Some(decode)) if decode.state == LeaseState::Issued => {
+                    decode.state = LeaseState::Dispatched { at };
+                    if let Some((target, _)) = named {
+                        if target != decode.target {
+                            rebook(&leases.counts, &mut held.decode, world.booked_of(target));
+                            decode.target = target;
+                        }
+                        decode.target_index = dispatch.target_index;
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
         if held.record.state != LeaseState::Issued {
             return true;
         }
@@ -2316,13 +2444,7 @@ impl LeasesStore for MemoryStore {
             return true;
         };
         if target != held.record.target {
-            if let Some(booked) = held.booked {
-                leases.counts.free(booked);
-            }
-            held.booked = world.booked_of(target);
-            if let Some(booked) = held.booked {
-                leases.counts.book(booked);
-            }
+            rebook(&leases.counts, &mut held.booked, world.booked_of(target));
             held.record.target = target;
         }
         held.record.lease.target_index = dispatch.target_index;
@@ -2331,15 +2453,17 @@ impl LeasesStore for MemoryStore {
 
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool {
         let mut leases = self.leases.lock();
-        let Some(held) = leases.records.get(&(gateway, lease)) else {
+        let key = (gateway, lease);
+        let Some(held) = leases.records.get(&key) else {
             return false;
         };
-        // A pair's room lives until its decode side ends: the prefill side's
-        // completion leaves the record standing.
-        if held.record.decode.is_some() && outcome.side == Side::Prefill {
-            return true;
+        // A pair's side ends alone and gives its count back: the record
+        // stands until its last side ends.
+        if held.record.decode.is_some() {
+            leases.end_side(&key, outcome.side, LeaseState::Completed);
+        } else {
+            leases.end(&key);
         }
-        leases.end(&(gateway, lease));
         true
     }
 
@@ -2347,12 +2471,21 @@ impl LeasesStore for MemoryStore {
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-        _side: Option<Side>,
-        _reason: ReleaseReason,
+        side: Option<Side>,
+        reason: ReleaseReason,
     ) -> bool {
-        // No side is read yet: a release of one side of a pair ends the
-        // whole lease. The step that issues a pair's lease reads it.
-        self.leases.lock().end(&(gateway, lease)).is_some()
+        let mut leases = self.leases.lock();
+        let key = (gateway, lease);
+        // One side of a pair's lease ends alone. A release with no side,
+        // and any release of a single's lease, ends the lease.
+        if let Some(side) = side {
+            let pair = |held: &Held| held.record.decode.is_some();
+            if leases.records.get(&key).is_some_and(pair) {
+                leases.end_side(&key, side, LeaseState::Released(reason));
+                return true;
+            }
+        }
+        leases.end(&key).is_some()
     }
 
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord> {
@@ -2366,7 +2499,7 @@ impl LeasesStore for MemoryStore {
     fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
         let mut leases = self.leases.lock();
         let (mut ended, mut steps) = (Vec::new(), usize::MAX);
-        while let Some(record) = leases.end_due(now, &mut steps) {
+        while let Some((record, _)) = leases.end_due(now, &mut steps) {
             ended.push(record);
         }
         ended
@@ -2383,7 +2516,7 @@ impl LeasesStore for MemoryStore {
             if record.gateway != gateway || record.term > term {
                 continue;
             }
-            let booked = world.booked_of(record.target);
+            let booked = slots(&world, record);
             leases.file((gateway, record.lease.id), *record, booked);
         }
         leases
@@ -2435,13 +2568,7 @@ impl LeasesStore for MemoryStore {
             .lock()
             .records
             .iter()
-            .filter(|((owner, _), held)| {
-                *owner == gateway
-                    && matches!(
-                        held.record.state,
-                        LeaseState::Issued | LeaseState::Dispatched { .. }
-                    )
-            })
+            .filter(|((owner, _), held)| *owner == gateway && held.record.is_live())
             .count()
     }
 }
