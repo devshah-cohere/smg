@@ -7,7 +7,10 @@ use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
     affinity::WarmRule,
-    builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
+    builtins::{
+        target_of, Best, FewestSessions, LeastRequests, Random, RowTests,
+        DEFAULT_MEAN_PREFILL_TOKENS,
+    },
     decision::{
         Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
         TRACE_TOP,
@@ -277,6 +280,15 @@ pub trait Scorer: Lifecycle + Debug {
     fn warm_rule(&self) -> Option<WarmRule> {
         None
     }
+
+    /// The mean prefill this stage prices a request of unknown size at,
+    /// where it holds one. The engine reads it once, when it is built: a
+    /// profile's first stage that holds one says what a lease books for a
+    /// request that states no size ([`Engine::mean_prefill`]). The default
+    /// holds none.
+    fn mean_prefill(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// What a picker's narrowing left of the survivors: the first `compared` are
@@ -537,6 +549,14 @@ impl Profile {
     fn warm_rules(&self) -> impl Iterator<Item = WarmRule> + '_ {
         let stages = self.scorers.iter();
         stages.filter_map(|stage| stage.scorer.warm_rule())
+    }
+
+    /// The mean prefill of this profile's first stage that holds one
+    /// ([`Scorer::mean_prefill`]), the crate's default where none does.
+    fn mean_prefill(&self) -> u32 {
+        let mut stages = self.scorers.iter();
+        let held = stages.find_map(|stage| stage.scorer.mean_prefill());
+        held.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS)
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -2068,6 +2088,9 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
+    /// Per profile, what a lease books for a request that states no prompt
+    /// size ([`Self::mean_prefill`]). No decision reads it.
+    mean_prefills: Vec<u32>,
 }
 
 /// Which of a profile's leading stages are ranks, read once when the engine
@@ -2803,6 +2826,7 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        let mean_prefills = profiles.iter().map(Profile::mean_prefill).collect();
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -2835,6 +2859,7 @@ impl Engine {
             marks,
             row_tests,
             orders,
+            mean_prefills,
         }
     }
 
@@ -3036,6 +3061,19 @@ impl Engine {
 
     pub fn profiles(&self) -> &[Profile] {
         &self.profiles
+    }
+
+    /// What a lease books for a request that states no prompt size, where
+    /// profile `profile` decided ([`Trace::profile`]): the mean prefill
+    /// that profile's load stage prices a request of unknown size at
+    /// ([`Scorer::mean_prefill`]). The stage prices a request in flight
+    /// that no report and no credit accounts for at that mean, so the
+    /// request costs its worker the same before its dispatch is credited
+    /// and after. The crate's default where the profile holds no such
+    /// stage, and for an index past this engine's profiles.
+    pub fn mean_prefill(&self, profile: u16) -> u32 {
+        let held = self.mean_prefills.get(usize::from(profile));
+        held.copied().unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS)
     }
 
     /// The first binding that matches, as the spec orders them, and as the
@@ -4069,6 +4107,48 @@ mod tests {
             decode_profile: None,
             ..pair_binding()
         }
+    }
+
+    /// What a lease books for a request that states no size is read at the
+    /// build: a profile's first stage that holds a mean prefill says it,
+    /// and the crate's default stands where none does.
+    #[test]
+    fn the_build_reads_each_profiles_mean_prefill() {
+        use crate::builtins::{LeastLoad, ResidentWork};
+        let profile = |stages: Vec<Box<dyn Scorer>>| Profile {
+            name: "p".into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: stages
+                .into_iter()
+                .map(|scorer| Weighted {
+                    scorer,
+                    weight: 1.0,
+                })
+                .collect(),
+            picker: Box::new(Best),
+        };
+        let load = |mean: u32| -> Box<dyn Scorer> { Box::new(LeastLoad::new(0.0, mean, 1.0)) };
+        let resident = |mean: u32| -> Box<dyn Scorer> {
+            let mut stage = ResidentWork::new(64);
+            stage.mean_prefill_tokens = mean;
+            Box::new(stage)
+        };
+        let engine = Engine::new(
+            vec![
+                profile(vec![load(300)]),
+                profile(vec![Box::new(LeastRequests), resident(700)]),
+                profile(vec![load(300), resident(700)]),
+                profile(vec![Box::new(LeastRequests)]),
+            ],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        // The load stage's own number, a stage behind another, the first of
+        // two, no such stage, and a profile the engine does not hold.
+        let read: Vec<u32> = (0..5).map(|index| engine.mean_prefill(index)).collect();
+        let default = DEFAULT_MEAN_PREFILL_TOKENS;
+        assert_eq!(read, [300, 700, 300, default, default]);
     }
 
     /// A pair's decode side runs under the model's pair binding, so the

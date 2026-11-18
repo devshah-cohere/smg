@@ -896,7 +896,13 @@ fn decide_in(
                     verdict: pick.session_verdict,
                     generation: pick.trace.generation,
                     session: facts.session(),
-                    tokens: facts.prompt_tokens,
+                    // A request that states no size books the mean prefill
+                    // of the profile that decided: one test where it states
+                    // one.
+                    tokens: match facts.prompt_tokens {
+                        0 => engine.mean_prefill(pick.trace.profile),
+                        stated => stated,
+                    },
                     now_micros: facts.now_micros,
                     built: None,
                 })
@@ -924,7 +930,9 @@ struct Booking {
     generation: u64,
     /// The request's session; none for a request with no key.
     session: Session,
-    /// The token-work the lease books: the prompt, as its host counted it.
+    /// The token-work the lease books: the prompt as its host counted it,
+    /// or the mean prefill of the profile that decided where the request
+    /// states no size.
     tokens: u32,
     /// The decision's instant in the rows' clock.
     now_micros: u64,
@@ -1273,7 +1281,7 @@ pub(crate) mod tests {
         Reads, Refused, Taken, PARTS, TERM_MARK,
     };
     use crate::{
-        builtins::Random,
+        builtins::{Random, DEFAULT_MEAN_PREFILL_TOKENS},
         catalog::Catalog,
         controller::{
             election::Standing,
@@ -1285,14 +1293,15 @@ pub(crate) mod tests {
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
         lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
-        spec::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
+        spec::{AppliedSpec, LeastLoadParams, PolicySpec, PowerOfTwoMetric, ScoreStage},
         store::{
             leases::DISPATCH_TTL, Ask, Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore,
-            MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
+            WorkersStore, PUBLISH_WINDOW,
         },
         view::{
-            fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role,
-            WireModes, WorkerId,
+            fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, PoolFacts, RequestFacts,
+            Role, WireModes, WorkerId,
         },
     };
 
@@ -1789,10 +1798,12 @@ pub(crate) mod tests {
             (picked(&answer), 1, LeaseState::Issued, fingerprint(&[7]))
         );
         assert_eq!(filed.dispatch_deadline, filed.issued_at + DISPATCH_TTL);
-        // The next decision's id is the term's next count, its lease
-        // carries its request's prompt tokens, and both leases stand for
-        // their gateway alone.
-        assert_eq!(lease.tokens, 0, "a request that states no prompt");
+        // The request states no prompt size and its profile holds no load
+        // stage: the lease books the crate's mean prefill. The next
+        // decision's id is the term's next count, its lease carries its
+        // request's prompt tokens, and both leases stand for their gateway
+        // alone.
+        assert_eq!(lease.tokens, DEFAULT_MEAN_PREFILL_TOKENS);
         let mut prompted = frame(8, 8);
         let facts = prompted.facts.as_mut();
         let facts = facts.expect("the case's frame has facts");
@@ -1814,6 +1825,84 @@ pub(crate) mod tests {
         let filed = filed.expect("the lease is on file").lease;
         assert_ne!(session, 0);
         assert_eq!(filed.session.get(), session);
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_request_that_stated_no_size_is_priced_until_its_workers_next_report() {
+        use crate::controller::lifecycle::dispatched;
+        let mut bed = bed(Some(preset("least_load", 1)), true, (2, 8), []);
+        // Each member reports at the take, at one rate: the first holds no
+        // work and the other two a quarter of a mean prompt each. The
+        // window the first record opens ends, and one world shows the
+        // three.
+        let (sink, at): (&dyn LoadSink, _) = (bed.store.as_ref(), bed.script.taken);
+        for (turn, &id) in bed.workers.iter().enumerate() {
+            let row = LoadRow {
+                waiting_uncached_tokens: if turn == 0 { 0 } else { 256 },
+                live_rate: 1_000,
+                ..LoadRow::default()
+            };
+            sink.record(id, 0, row, at, LoadSource::Stream);
+        }
+        sink.publish(at + PUBLISH_WINDOW);
+        // Three requests that state no prompt size, each dispatched before
+        // the next is decided. A dispatched lease is its worker's credit
+        // until that worker's next report: one that booked no tokens would
+        // cost nothing there, and each request would read the first member
+        // as free.
+        let mut named = Vec::new();
+        for id in 1..=3u8 {
+            let answer = bed.ask(frame(id, u64::from(id))).await;
+            named.push(picked(&answer));
+            let frame = proto::Dispatched {
+                lease_id: lease_of(&answer).id,
+                target_index: 0,
+                side: proto::Side::Single.into(),
+                since_decision_micros: 250,
+            };
+            dispatched(&bed.store, GATEWAY, &frame, bed.script.taken).expect("the frame reads");
+        }
+        assert_eq!(named[0], bed.workers[0], "the member with no work");
+        let members: BTreeSet<WorkerId> = named.iter().copied().collect();
+        assert_eq!(members.len(), 3, "each member took one request: {named:?}");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_states_no_size_books_the_mean_prefill_of_the_profile_that_decided() {
+        // Two profiles whose load stages hold two means, neither the crate's
+        // default: the preset's own, and one bound to a second model ahead
+        // of it.
+        let load = |mean_prefill_tokens: u32| {
+            let params = LeastLoadParams {
+                mean_prefill_tokens: Some(mean_prefill_tokens),
+                ..LeastLoadParams::default()
+            };
+            vec![ScoreStage::LeastLoad(params).into()]
+        };
+        let mut document = PolicySpec::preset("least_load").expect("a preset of this build");
+        document.generation = 1;
+        let mut light = document.profiles["least_load"].clone();
+        light.score = load(512);
+        let own = document.profiles.get_mut("least_load");
+        own.expect("the preset's profile").score = load(2_048);
+        document.profiles.insert("light".to_owned(), light);
+        let mut binding = document.bindings[0].clone();
+        binding.matcher.model = "model-b".to_owned();
+        binding.profile = Some("light".to_owned());
+        document.bindings.insert(0, binding);
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        ready(&bed.store, "x0", "model-b", Role::Single, WireModes::NONE);
+        // Each request books the number of the profile that decided it,
+        let answer = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&answer).tokens, 2_048);
+        let answer = bed.ask(frame_for("model-b", 3, 3)).await;
+        assert_eq!(lease_of(&answer).tokens, 512);
+        // and a size the request states is booked as stated.
+        let mut sized = frame(2, 2);
+        let facts = sized.facts.as_mut();
+        facts.expect("the case's frame has facts").prompt_tokens = 48;
+        let answer = bed.ask(sized).await;
+        assert_eq!(lease_of(&answer).tokens, 48);
     }
 
     #[tokio::test]

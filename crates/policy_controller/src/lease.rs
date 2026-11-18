@@ -66,8 +66,13 @@ pub struct Lease {
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
-    /// Token-work the decision books on its target: the prompt, or the
-    /// host's mean estimate when the prompt's size is unknown.
+    /// Token-work the decision books on its target: the prompt, or, for a
+    /// request that states no size, the mean prefill of the profile that
+    /// decided ([`crate::Engine::mean_prefill`]): its load stage's own
+    /// estimate, the crate's default where it holds none. The host fills
+    /// it: the served controller at its booking, and a host that embeds
+    /// the engine by the same call. A stage that reads a lease's tokens
+    /// reads a priced request.
     pub tokens: u32,
 }
 

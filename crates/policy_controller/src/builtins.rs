@@ -1044,6 +1044,13 @@ impl Scorer for LeastLoad {
             ..Needs::default()
         }
     }
+
+    /// The mean this stage prices a request at that no report and no credit
+    /// accounts for: a lease that books it for a request of no stated size
+    /// costs its worker the same once its dispatch is credited.
+    fn mean_prefill(&self) -> Option<u32> {
+        Some(self.mean_prefill_tokens)
+    }
 }
 
 /// The resident work, in context tokens, lower better: what a worker's
@@ -1197,6 +1204,10 @@ impl Scorer for ResidentWork {
             loads: true,
             ..Needs::default()
         }
+    }
+
+    fn mean_prefill(&self) -> Option<u32> {
+        Some(self.mean_prefill_tokens)
     }
 }
 
