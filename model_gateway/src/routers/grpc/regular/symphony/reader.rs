@@ -908,7 +908,8 @@ impl Reader {
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
     /// reader's one way in. A call the step started takes its family's id first, where the
     /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
-    /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), and the rest
+    /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), a call kept
+    /// after one takes its family's id by the place it is returned in, and the rest are
     /// limited to the first call where the request asks. An output the engine refuses is
     /// recorded as failed for the table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
@@ -1029,6 +1030,18 @@ impl Reader {
                     tally.see(event, first_call_only);
                 }
             });
+            // A call kept after a dropped one moved down: where the family numbers its ids by
+            // the conversation, its id is the one of the place it is returned in.
+            if let Some((family, history)) = self.forced_ids {
+                for event in fresh.iter_mut() {
+                    if let Event::ToolCallStart {
+                        index, id, name, ..
+                    } = event
+                    {
+                        *id = family.id(name, *index as usize, history);
+                    }
+                }
+            }
         }
         if self.first_call_only {
             symphony::event::first_call_only(fresh);
@@ -3381,6 +3394,99 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Under a choice that forbids some calls a family that numbers its ids by the conversation
+    /// numbers the calls returned: a call kept after a dropped one takes the id of the place it
+    /// is returned in, so the first call of the next turn, counted on from the one call the
+    /// history then holds, takes a different id.
+    #[test]
+    fn a_call_kept_after_a_dropped_one_takes_the_familys_id_of_its_place() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        let list = r#"[{"name": "undeclared", "parameters": {"q": 1}}, {"name": "lookup", "parameters": {"q": 2}}]"#;
+        let first = json!([{"role": "user", "content": "hi"}]);
+        for (model, table, ids) in [
+            (
+                "moonshotai/Kimi-K2-Instruct",
+                Table::KimiK2,
+                ["functions.lookup:0", "functions.lookup:1"],
+            ),
+            (
+                "moonshotai/Kimi-K3",
+                Table::KimiK3,
+                ["lookup_0", "lookup_1"],
+            ),
+        ] {
+            // The second turn's history holds the one call the first turn returned.
+            let second = json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": ids[0], "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": ids[0], "content": "1"},
+            ]);
+            for (history, id) in [(first.clone(), ids[0]), (second, ids[1])] {
+                let forced = request(json!({
+                    "model": model, "messages": history,
+                    "tools": declared.clone(), "tool_choice": "required",
+                }));
+                let assignment = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&forced),
+                    Some(&schema),
+                    "",
+                    ProviderProfile::for_model(&forced.model),
+                    || GrammarStart::Unknown,
+                )
+                .expect("the table reads the forced call");
+                let mut replayed = Events::new();
+                let mut reader =
+                    Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+                let events = read_tail(&mut reader, list);
+                assert_eq!(ids_of(&events), [id], "{model}: {events:?}");
+            }
+        }
+    }
+
+    /// Two calls kept after a dropped one take the ids of the first two places, where the family
+    /// numbers its ids by the conversation.
+    #[test]
+    fn two_calls_kept_after_a_dropped_one_take_the_familys_ids_of_their_places() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        let list = r#"[{"name": "undeclared", "parameters": {"q": 1}}, {"name": "lookup", "parameters": {"q": 2}}, {"name": "lookup", "parameters": {"q": 3}}]"#;
+        for (model, table, ids) in [
+            (
+                "moonshotai/Kimi-K2-Instruct",
+                Table::KimiK2,
+                ["functions.lookup:0", "functions.lookup:1"],
+            ),
+            (
+                "moonshotai/Kimi-K3",
+                Table::KimiK3,
+                ["lookup_0", "lookup_1"],
+            ),
+        ] {
+            let forced = request(json!({
+                "model": model, "messages": [{"role": "user", "content": "hi"}],
+                "tools": declared.clone(), "tool_choice": "required",
+            }));
+            let assignment = assign_for(
+                Reading::Table(table.shared(), false),
+                Asks::Chat(&forced),
+                Some(&schema),
+                "",
+                ProviderProfile::for_model(&forced.model),
+                || GrammarStart::Unknown,
+            )
+            .expect("the table reads the forced call");
+            let mut replayed = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+            let events = read_tail(&mut reader, list);
+            assert_eq!(ids_of(&events), ids, "{model}: {events:?}");
+        }
     }
 
     /// A forced call's JSON has no header for the table to take an id from. On a family that
