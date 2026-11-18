@@ -17,7 +17,7 @@ use symphony::{
 use tracing::{debug, Span};
 
 use super::{
-    constraint::Asks,
+    constraint::{Asks, Forbids},
     names::Reading,
     telemetry::{self, Tally, Who},
     SymphonyError,
@@ -35,10 +35,11 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
-    /// The request forbade the calls the table reads (`tool_choice: none`,
-    /// [`Asks::forbids_calls_for`]): the reader drops every call, as the engine's own server reads
-    /// such a call and withholds it.
-    pub forbids_calls: bool,
+    /// The calls the request's `tool_choice` forbids among those the table reads
+    /// ([`Asks::forbids_for`]): every call under `none`, a call outside the callable tools under
+    /// a named function, an allowed list or `required`. The reader drops such a call, as the
+    /// engine's own server reads a call under `none` and withholds it.
+    pub forbids_calls: Forbids,
     /// The request asked for generation past the model's own end of output (`ignore_eos`,
     /// [`Asks::past_the_end`]): the output carries an unconstrained tail after the answer, which
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
@@ -89,7 +90,7 @@ pub(super) fn assignment(
     format: Arc<Format>,
     model: &str,
     prompt: &str,
-    forbids_calls: bool,
+    forbids_calls: Forbids,
     past_the_end: bool,
     forcing: Option<String>,
     forced_ids: Option<(CallIdFamily, usize)>,
@@ -376,7 +377,7 @@ pub(crate) fn assign_for(
             format,
             asks.model(),
             prompt,
-            asks.forbids_calls_for(provider),
+            asks.forbids_for(provider),
             asks.past_the_end(),
             forcing,
             forced_ids,
@@ -555,10 +556,10 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
-    /// Drop the events of every call: the request forbade them (`tool_choice: none`), the table
-    /// read them whole, and the engine's own server delivers nothing of such a call
-    /// ([`Assignment::forbids_calls`]).
-    forbids_calls: bool,
+    /// The calls the request's `tool_choice` forbids ([`Assignment::forbids_calls`]), dropped as
+    /// the output makes them: the table read them whole, and the engine's own server delivers
+    /// nothing of a call under `none`.
+    forbidden: ForbiddenCalls,
     /// Give every call the family's id by its place in the conversation
     /// ([`Assignment::forced_ids`]).
     forced_ids: Option<(CallIdFamily, usize)>,
@@ -617,6 +618,7 @@ impl Reader {
         tools: Arc<[Tool]>,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        let forbids = assignment.forbids_calls.over(&tools);
         let declared = match &assignment.forcing {
             Some(name) => Declared::shared(tools).forcing(name.clone()),
             None => Declared::shared(tools),
@@ -634,7 +636,12 @@ impl Reader {
             read: 0,
             ended: false,
             first_call_only: false,
-            forbids_calls: assignment.forbids_calls,
+            forbidden: ForbiddenCalls {
+                any: forbids != Forbids::Nothing,
+                forbids,
+                dropping: None,
+                dropped: 0,
+            },
             forced_ids: assignment.forced_ids,
             shown: false,
             unshown: String::new(),
@@ -901,7 +908,8 @@ impl Reader {
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
     /// reader's one way in. A call the step started takes its family's id first, where the
     /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
-    /// and limited to the first call where the request asks. An output the engine refuses is
+    /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), and the rest
+    /// limited to the first call where the request asks. An output the engine refuses is
     /// recorded as failed for the table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
         let before = out.len();
@@ -928,14 +936,18 @@ impl Reader {
                 }
             }
         }
+        // A step that adds no event ends here: nothing below acts on it.
+        if fresh.is_empty() {
+            return Ok(());
+        }
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
         for event in fresh.iter() {
-            if self.forbids_calls {
-                self.tally.see_forbidden(event);
-            } else {
-                self.tally.see(event, self.first_call_only);
+            if self.forbidden.any {
+                // Tallied at the step's end, where the calls the choice forbids are dropped.
+                break;
             }
+            self.tally.see(event, self.first_call_only);
         }
         // While the output makes no call, the bytes of the call blocks the table refuses are
         // kept for the end ([`Self::end`]), with the marker that led into the first and what the
@@ -1008,9 +1020,17 @@ impl Reader {
                 }
             }
         }
-        if self.forbids_calls {
-            symphony::event::forbidden_calls(fresh);
-        } else if self.first_call_only {
+        if self.forbidden.any {
+            let (tally, first_call_only) = (&mut self.tally, self.first_call_only);
+            self.forbidden.drop_from(fresh, |event, forbidden| {
+                if forbidden {
+                    tally.see_forbidden(event);
+                } else {
+                    tally.see(event, first_call_only);
+                }
+            });
+        }
+        if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
         Ok(())
@@ -1072,6 +1092,92 @@ impl Reader {
     fn drop_held(&mut self) {
         self.refused.clear();
         self.clear_framing();
+    }
+}
+
+/// The calls of one output that the request's `tool_choice` forbids ([`Forbids`]), dropped as the
+/// reader meets them: every call under `none`; under a named function, an allowed list or
+/// `required`, each call to a function outside the tools the choice leaves callable; none under
+/// `auto`.
+struct ForbiddenCalls {
+    /// The choice forbids a call, some or every one: the one test a step pays under `auto`, which
+    /// forbids none and whose steps the reader tallies itself ([`Reader::feed`]).
+    any: bool,
+    forbids: Forbids,
+    /// Under a choice that forbids some calls and not others: the engine's index of the call
+    /// being dropped.
+    dropping: Option<u32>,
+    /// How many calls were dropped so far, by which a call kept after them moves down.
+    dropped: u32,
+}
+
+impl ForbiddenCalls {
+    /// For a step under a choice that forbids calls ([`Self::any`]; a step under `auto` the reader
+    /// tallies itself): tells `seen` of each of the step's `fresh` events, with whether the choice
+    /// forbids it (under `none`, where no call is kept, every event of the output), then rewrites
+    /// a forbidden call's events as dropped text (`event::forbidden_calls`): never a call or
+    /// content. Under a choice that forbids some calls and not others a call is asked once, at
+    /// its start ([`Forbids::call_to`]): by its function's name and by the engine's word on
+    /// whether the request declares it, the `Malformed { UnknownTool }` event of no bytes right
+    /// before the start, which goes with the call it announces. The call's later events follow
+    /// that answer by their index, so no name is compared on a delta. A table reads one call at
+    /// a time, so a call kept after a dropped one moves down by the count dropped before it, and
+    /// the calls delivered are numbered from zero; the finish counts the calls kept, and with
+    /// none kept it is forbidden too: a `tool_calls` finish is the engine's `stop` again.
+    fn drop_from(&mut self, fresh: &mut [Event<'_>], mut seen: impl FnMut(&Event<'_>, bool)) {
+        match self.forbids {
+            Forbids::Nothing => {}
+            Forbids::Every => {
+                for event in fresh.iter() {
+                    seen(event, true);
+                }
+                symphony::event::forbidden_calls(fresh);
+            }
+            Forbids::Undeclared | Forbids::AllBut(_) => {
+                let mut undeclared = false;
+                for event in fresh {
+                    let announced = std::mem::take(&mut undeclared);
+                    let forbidden = match event {
+                        // The mark of a call to a function the request did not declare, which no
+                        // choice leaves callable.
+                        Event::Malformed {
+                            why: symphony::MalformedReason::UnknownTool,
+                            ..
+                        } => {
+                            undeclared = true;
+                            true
+                        }
+                        Event::ToolCallStart { index, name, .. } => {
+                            let forbidden = self.forbids.call_to(name, !announced);
+                            if forbidden {
+                                self.dropping = Some(*index);
+                                self.dropped += 1;
+                            } else {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        Event::ToolCallArguments { index, .. }
+                        | Event::ToolCallEnd { index, .. } => {
+                            let forbidden = self.dropping == Some(*index);
+                            if !forbidden {
+                                *index -= self.dropped;
+                            }
+                            forbidden
+                        }
+                        Event::Finish { tool_calls, .. } => {
+                            *tool_calls -= self.dropped;
+                            self.dropped > 0 && *tool_calls == 0
+                        }
+                        _ => false,
+                    };
+                    seen(&*event, forbidden);
+                    if forbidden {
+                        symphony::event::forbidden_calls(std::slice::from_mut(event));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1198,7 +1304,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -2166,7 +2272,7 @@ mod tests {
             table_of(&refused),
             "none keeps the calls the provider reads; the reader drops them"
         );
-        assert!(forbidden.forbids_calls);
+        assert_eq!(forbidden.forbids_calls, Forbids::Every);
         let declared_none = request(json!({"tools": []}));
         assert!(scans_for_tool_calls_for(
             &declared_none,
@@ -3458,7 +3564,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(symphony::formats::inkling().without_calls()),
                 prompt: "<|message_model|>".to_string(),
-                forbids_calls: false,
+                forbids_calls: Forbids::Nothing,
                 past_the_end: false,
                 forcing: None,
                 opener: None,
@@ -3503,7 +3609,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3581,7 +3687,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3644,7 +3750,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3678,7 +3784,7 @@ mod tests {
                     Arc::new(qwen3(CallSyntax::Json)),
                     "Qwen/Qwen3-8B",
                     PROMPT,
-                    false,
+                    Forbids::Nothing,
                     false,
                     None,
                     None,
@@ -3731,7 +3837,7 @@ mod tests {
                     Arc::new(symphony::formats::qwen2_5()),
                     "Qwen/Qwen2.5-7B-Instruct",
                     "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
-                    false,
+                    Forbids::Nothing,
                     false,
                     None,
                     None,
@@ -3791,7 +3897,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3922,7 +4028,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -3959,7 +4065,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4013,7 +4119,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4053,7 +4159,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: true,
+            forbids_calls: Forbids::Every,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4109,7 +4215,7 @@ mod tests {
         assert!(forbidden.ends_with(" 1"), "{forbidden}");
         // The same output under `auto` is a call: the ask, not the table, decides.
         let allowed = Assignment {
-            forbids_calls: false,
+            forbids_calls: Forbids::Nothing,
             past_the_end: false,
             forcing: None,
             opener: None,
@@ -4312,7 +4418,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
-                forbids_calls: false,
+                forbids_calls: Forbids::Nothing,
                 past_the_end: false,
                 forcing: None,
                 opener: None,

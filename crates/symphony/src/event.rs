@@ -150,8 +150,9 @@ pub enum DropReason {
     Whitespace,
     /// A call after the first, where the request takes one call only ([`first_call_only`]).
     LaterCall,
-    /// A call the request forbade (`tool_choice: none`), read whole so its bytes are no content
-    /// and delivered as none ([`forbidden_calls`]).
+    /// A call the request forbade (every call under `tool_choice: none`; under a choice that
+    /// narrows the tools, a call to a function it leaves out), read whole so its bytes are no
+    /// content and delivered as none ([`forbidden_calls`]).
     ForbiddenCall,
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
