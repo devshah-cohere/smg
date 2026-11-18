@@ -909,7 +909,7 @@ impl Reader {
     /// reader's one way in. A call the step started takes its family's id first, where the
     /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
     /// the calls the request's choice forbids are dropped ([`ForbiddenCalls`]), a call kept
-    /// after one takes its family's id by the place it is returned in, and the rest are
+    /// after a dropped one takes its family's id by the place it is returned in, and the rest are
     /// limited to the first call where the request asks. An output the engine refuses is
     /// recorded as failed for the table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
@@ -1031,14 +1031,17 @@ impl Reader {
                 }
             });
             // A call kept after a dropped one moved down: where the family numbers its ids by
-            // the conversation, its id is the one of the place it is returned in.
-            if let Some((family, history)) = self.forced_ids {
-                for event in fresh.iter_mut() {
-                    if let Event::ToolCallStart {
-                        index, id, name, ..
-                    } = event
-                    {
-                        *id = family.id(name, *index as usize, history);
+            // the conversation, its id is the one of the place it is returned in. Until a call
+            // is dropped every call keeps the id it took at the step's start.
+            if self.forbidden.dropped > 0 {
+                if let Some((family, history)) = self.forced_ids {
+                    for event in fresh.iter_mut() {
+                        if let Event::ToolCallStart {
+                            index, id, name, ..
+                        } = event
+                        {
+                            *id = family.id(name, *index as usize, history);
+                        }
                     }
                 }
             }
